@@ -512,21 +512,65 @@ export const adminHardDeleteUser = createServerFn({ method: "POST" })
     if (data.id === context.userId) {
       throw new Error("You cannot delete your own account.");
     }
+
+    // Profile may be missing (orphaned auth record). Don't hard-fail.
     const { data: prof } = await context.supabase
       .from("profiles")
       .select("display_name,email")
       .eq("id", data.id)
       .maybeSingle();
-    if (!prof) throw new Error("User not found");
-    if ((prof.display_name ?? "").trim() !== data.confirmName.trim()) {
-      throw new Error("Confirmation name does not match");
-    }
-    const targetEmail = (prof as { email?: string }).email ?? null;
-    console.log(`${tag} target email=${targetEmail ?? "(unknown)"}`);
+    const profileExists = !!prof;
+    console.log(`${tag} profile exists=${profileExists}`);
 
-    // Phase 1: in-DB cleanup via SECURITY DEFINER RPC (validates target is
-    // not an admin, scrubs public.* rows that don't have ON DELETE CASCADE,
-    // and best-effort deletes auth.users). Throws if Forbidden / admin target.
+    // Look up the auth row up front. getUserById can either return {user:null}
+    // or throw a "User not found" error depending on SDK version — treat both
+    // as "no auth row".
+    const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const admin = supabaseAdmin.auth.admin as any;
+
+    const safeGetAuthUser = async (id: string) => {
+      try {
+        const { data: r, error } = await admin.getUserById(id);
+        if (error) {
+          if (/not.?found|user.*not.*exist/i.test(error.message ?? "")) return null;
+          throw error;
+        }
+        return r?.user ?? null;
+      } catch (e) {
+        const msg = e instanceof Error ? e.message : String(e);
+        if (/not.?found|user.*not.*exist/i.test(msg)) return null;
+        throw e;
+      }
+    };
+
+    const preAuthUser = await safeGetAuthUser(data.id);
+    const targetEmail =
+      ((prof as { email?: string } | null)?.email ?? preAuthUser?.email ?? null) || null;
+    console.log(
+      `${tag} preflight: authExists=${!!preAuthUser} email=${targetEmail ?? "(unknown)"}`,
+    );
+
+    if (!profileExists && !preAuthUser) {
+      console.log(`${tag} nothing to delete — already gone`);
+      return { ok: true, email: null, alreadyGone: true as const };
+    }
+
+    // Confirmation name check — only enforce if we have a profile display_name.
+    // For orphaned auth-only records the admin may type the email instead.
+    if (profileExists) {
+      const expected = (prof?.display_name ?? "").trim();
+      const provided = data.confirmName.trim();
+      const emailMatch =
+        targetEmail && provided.toLowerCase() === targetEmail.toLowerCase();
+      if (expected && provided !== expected && !emailMatch) {
+        throw new Error("Confirmation name does not match");
+      }
+    }
+
+    // Phase 1: in-DB cleanup via SECURITY DEFINER RPC. Tolerant of missing
+    // profile rows (RPC uses DELETE ... WHERE id = _id, which no-ops when
+    // already gone). Still throws on Forbidden / admin-target.
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const { error: rpcErr } = await (context.supabase as any).rpc("admin_hard_delete_user", {
       _id: data.id,
@@ -537,29 +581,33 @@ export const adminHardDeleteUser = createServerFn({ method: "POST" })
     }
     console.log(`${tag} Phase 1 RPC cleanup OK`);
 
-    // Phase 2: canonical removal via Supabase Auth Admin API. This guarantees
-    // auth.identities, auth.sessions, auth.refresh_tokens, MFA factors and the
-    // auth.users row itself are gone. All public.* tables that reference
-    // auth.users(id) ON DELETE CASCADE are cleaned by Postgres at this point.
-    //
-    // CRITICAL: If this step fails the email stays "registered" in auth.users
-    // and the person cannot re-sign-up. We MUST propagate the error to the
-    // admin — never report success while the auth row may linger.
+    // Phase 2: auth deletion via Admin API. Only attempt if the row existed
+    // at preflight (or the RPC may have already removed it). "User not found"
+    // here is a SUCCESS signal — the row is gone, which is what we want.
+    let authDeleteOutcome: "deleted" | "already-gone" | "skipped" = "skipped";
     try {
-      const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
-
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      const { error: authErr } = await (supabaseAdmin.auth.admin as any).deleteUser(data.id);
-      if (authErr && !/User not found/i.test(authErr.message ?? "")) {
-        console.error(`${tag} Phase 2 auth.admin.deleteUser failed:`, authErr);
-        throw authErr;
+      if (preAuthUser) {
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        const { error: authErr } = await admin.deleteUser(data.id);
+        if (authErr) {
+          if (/not.?found|user.*not.*exist/i.test(authErr.message ?? "")) {
+            console.log(`${tag} Phase 2 auth row already absent (treated as success)`);
+            authDeleteOutcome = "already-gone";
+          } else {
+            console.error(`${tag} Phase 2 auth.admin.deleteUser failed:`, authErr);
+            throw authErr;
+          }
+        } else {
+          console.log(`${tag} Phase 2 auth.admin.deleteUser OK`);
+          authDeleteOutcome = "deleted";
+        }
+      } else {
+        console.log(`${tag} Phase 2 skipped — no auth row at preflight`);
       }
-      console.log(`${tag} Phase 2 auth.admin.deleteUser OK`);
 
-      // Phase 3: verify the auth.users row is actually gone.
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      const { data: check } = await (supabaseAdmin.auth.admin as any).getUserById(data.id);
-      if (check?.user) {
+      // Phase 3: verify auth.users row is gone. Missing == success.
+      const postAuthUser = await safeGetAuthUser(data.id);
+      if (postAuthUser) {
         console.error(`${tag} Phase 3 verification FAILED — auth.users row still present`);
         throw new Error(
           "User still exists in auth.users after deletion. The email will remain blocked for re-registration.",
@@ -567,16 +615,13 @@ export const adminHardDeleteUser = createServerFn({ method: "POST" })
       }
       console.log(`${tag} Phase 3 verification OK — auth.users row removed`);
 
-      // Phase 4 (defensive): if an email was known, also confirm no other
-      // auth.users row holds it (rare, but possible after manual edits).
+      // Phase 4 (defensive): confirm email isn't held by another auth row.
       if (targetEmail) {
         // eslint-disable-next-line @typescript-eslint/no-explicit-any
-        const { data: list } = await (supabaseAdmin.auth.admin as any).listUsers({
-          page: 1,
-          perPage: 200,
-        });
+        const { data: list } = await admin.listUsers({ page: 1, perPage: 200 });
         const stillThere = (list?.users ?? []).find(
-          (u: { email?: string | null }) =>
+          (u: { id: string; email?: string | null }) =>
+            u.id !== data.id &&
             (u.email ?? "").toLowerCase() === targetEmail.toLowerCase(),
         );
         if (stillThere) {
@@ -592,14 +637,14 @@ export const adminHardDeleteUser = createServerFn({ method: "POST" })
       console.error(`${tag} auth deletion error:`, msg);
       throw new Error(
         `Failed to fully remove user from authentication system: ${msg}. ` +
-          "The profile was deleted but the auth account may still exist. " +
           "Verify SUPABASE_SERVICE_ROLE_KEY is configured in Lovable Cloud.",
       );
     }
 
-    console.log(`${tag} hard delete complete`);
-    return { ok: true, email: targetEmail };
+    console.log(`${tag} hard delete complete (auth=${authDeleteOutcome})`);
+    return { ok: true, email: targetEmail, authDeleteOutcome };
   });
+
 
 /**
  * Admin validation tool: check whether a user id or email still has any
