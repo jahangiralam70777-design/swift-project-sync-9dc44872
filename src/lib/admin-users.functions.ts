@@ -535,15 +535,40 @@ export const adminHardDeleteUser = createServerFn({ method: "POST" })
     // auth.identities, auth.sessions, auth.refresh_tokens, MFA factors and the
     // auth.users row itself are gone. All public.* tables that reference
     // auth.users(id) ON DELETE CASCADE are cleaned by Postgres at this point.
+    //
+    // CRITICAL: If this step fails, the email remains "registered" in
+    // auth.users and the person cannot re-sign-up. We MUST propagate the
+    // error to the admin instead of silently logging — otherwise the UI
+    // reports success while the auth row lingers.
+    let authDeleteError: unknown = null;
     try {
       const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       const { error: authErr } = await (supabaseAdmin.auth.admin as any).deleteUser(data.id);
       if (authErr && !/User not found/i.test(authErr.message ?? "")) {
-        console.warn("[adminHardDeleteUser] auth.admin.deleteUser failed", authErr);
+        authDeleteError = authErr;
+        console.error("[adminHardDeleteUser] auth.admin.deleteUser failed", authErr);
+      }
+
+      // Verification: confirm the row is actually gone from auth.users.
+      // getUserById returns { data: { user: null }, error: 'User not found' }
+      // once the deletion has taken effect.
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const { data: check } = await (supabaseAdmin.auth.admin as any).getUserById(data.id);
+      if (check?.user) {
+        throw new Error(
+          "User still exists in auth.users after deletion. The email will remain blocked for re-registration. " +
+            (authDeleteError instanceof Error ? authDeleteError.message : String(authDeleteError ?? "")),
+        );
       }
     } catch (e) {
-      console.warn("[adminHardDeleteUser] auth admin delete threw", e);
+      console.error("[adminHardDeleteUser] auth admin delete failed", e);
+      const msg = e instanceof Error ? e.message : String(e);
+      throw new Error(
+        `Failed to fully remove user from authentication system: ${msg}. ` +
+          "The profile was deleted but the auth account may still exist. " +
+          "Verify SUPABASE_SERVICE_ROLE_KEY is configured in Lovable Cloud.",
+      );
     }
     return { ok: true };
   });
