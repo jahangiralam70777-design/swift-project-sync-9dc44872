@@ -16,6 +16,7 @@ import { useRealtimeInvalidator } from "@/hooks/use-realtime-invalidator";
 import { usePrefs } from "@/lib/profile-prefs";
 import { ThemeInjector } from "@/components/site/ThemeInjector";
 import { SingleSessionGuard } from "@/components/auth/SingleSessionGuard";
+import { AccountStatusGuard } from "@/components/auth/AccountStatusGuard";
 import { SessionTimeoutGuard } from "@/components/auth/SessionTimeoutGuard";
 import { ActivityTracker } from "@/components/tracking/ActivityTracker";
 import { RootErrorBoundary } from "@/components/RootErrorBoundary";
@@ -301,6 +302,7 @@ function RootInner() {
     // prevents the "black screen during route change" flicker.
     <Suspense fallback={null}>
       <SingleSessionGuard />
+      <AccountStatusGuard />
       <SessionTimeoutGuard />
       <ActivityTracker />
       <Outlet />

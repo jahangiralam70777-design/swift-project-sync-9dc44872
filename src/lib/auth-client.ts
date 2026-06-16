@@ -67,7 +67,31 @@ export async function signInWithEmail(
   // login pages should pass intent: "admin" to skip the check entirely (defence
   // in depth — admin login must never be blocked).
   const { data, error } = await supabase.auth.signInWithPassword({ email, password });
-  if (error) throw error;
+  if (error) {
+    // Supabase returns a generic message for banned accounts. Translate it.
+    if (/banned|disabled|user.*not.*allowed/i.test(error.message ?? "")) {
+      throw new Error("Your account has been banned. Please contact support.");
+    }
+    throw error;
+  }
+
+  // Post-sign-in ban check (covers app-level user_bans rows that Supabase's
+  // native ban_duration may not yet reflect on first login). If banned,
+  // tear down the session immediately and surface a friendly message.
+  try {
+    const uid = data.user?.id;
+    if (uid) {
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const { data: banned } = await (supabase as any).rpc("is_user_banned", { _user_id: uid });
+      if (banned === true) {
+        await supabase.auth.signOut().catch(() => undefined);
+        throw new Error("Your account has been banned. Please contact support.");
+      }
+    }
+  } catch (e) {
+    if (e instanceof Error && /banned/i.test(e.message)) throw e;
+    // Fail open on RPC errors — guard will catch it post-login.
+  }
 
   // Resolve role from user_roles (admin / super_admin / moderator / student / user)
   let role: AppRole = roleFromAppMetadata(data.user?.app_metadata as Record<string, unknown>) ?? "student";
@@ -168,7 +192,14 @@ export async function signUpWithEmail(input: {
       },
     },
   });
-  if (error) throw error;
+  if (error) {
+    if (/already.*registered|already.*exists|user.*exists/i.test(error.message ?? "")) {
+      throw new Error(
+        "This email is already registered. If your account was banned, please contact support — banned accounts cannot be re-registered.",
+      );
+    }
+    throw error;
+  }
   return data;
 }
 
