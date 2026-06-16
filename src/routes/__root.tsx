@@ -302,6 +302,7 @@ function RootInner() {
     // prevents the "black screen during route change" flicker.
     <Suspense fallback={null}>
       <SingleSessionGuard />
+      <AccountStatusGuard />
       <SessionTimeoutGuard />
       <ActivityTracker />
       <Outlet />
