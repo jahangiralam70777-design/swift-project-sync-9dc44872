@@ -192,7 +192,14 @@ export async function signUpWithEmail(input: {
       },
     },
   });
-  if (error) throw error;
+  if (error) {
+    if (/already.*registered|already.*exists|user.*exists/i.test(error.message ?? "")) {
+      throw new Error(
+        "This email is already registered. If your account was banned, please contact support — banned accounts cannot be re-registered.",
+      );
+    }
+    throw error;
+  }
   return data;
 }
 
